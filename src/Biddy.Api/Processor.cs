@@ -9,34 +9,84 @@ public sealed class AuctionState
 }
 public sealed class Processor : BackgroundService
 {
-    private readonly Channel<ChannelRequest> _channel;
+    private readonly Channel<PlaceBidRequest> _channel;
     private readonly AuctionState _state;
 
-    public Processor(Channel<ChannelRequest> channel, AuctionState state)
+    public Processor(Channel<PlaceBidRequest> channel, AuctionState state)
     {
         _channel = channel;
         _state = state;
     }
-    protected async override Task ExecuteAsync(CancellationToken ct)
+    
+    protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        await foreach(var request in _channel.Reader.ReadAllAsync(ct))
+        try
         {
-            var current = _state.Highest;
-            await Task.Delay(1000, ct);
-            Console.WriteLine(request.message);
+            await foreach (var request in _channel.Reader.ReadAllAsync(ct))
+            {
+                try
+                {
+                    // await Task.Delay(1000, ct);
+                    Console.WriteLine(request.message);
 
-            if(current is null || request.amountInCents > current.AmountInCents)
-            {
-                _state.SetHighest(new WinningBid(request.id, request.amountInCents, request.userEmail, DateTime.UtcNow));
-                Console.WriteLine($"Bid:{request.id} accepted - {DateTime.UtcNow}");
+                    var current = _state.Highest;
+                    var now = DateTime.UtcNow;
+
+                    if (current is null || request.amountInCents > current.AmountInCents)
+                    {
+                        _state.SetHighest(new WinningBid(request.id, request.amountInCents, request.userEmail, now));
+                        Console.WriteLine($"Bid:{request.id} ACCEPTED A - {now}");
+                        request.complete.TrySetResult(
+                            new BidResult(request.id, BidOutcome.Accepted, request.amountInCents, now));
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Bid:{request.id} REJECTED R - {now}");
+                        request.complete.TrySetResult(
+                            new BidResult(request.id, BidOutcome.Outbid, current.AmountInCents, now));
+                    }
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    request.complete.TrySetCanceled(ct);
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Bid:{request.id} failed - {ex.Message}");
+                    request.complete.TrySetException(ex);
+                }
             }
-            else
-            {
-                Console.WriteLine($"Bid:{request.id} rejected - {DateTime.UtcNow}");
-            }
+        }
+        finally
+        {
+            _channel.Writer.TryComplete();
+            while (_channel.Reader.TryRead(out var pending))
+                pending.complete.TrySetCanceled();
         }
     }
 }
 
-public sealed record ChannelRequest(Guid id, int amountInCents, string userEmail, string message);
-public sealed record WinningBid(Guid Id, int AmountInCents, string UserEmail, DateTime AcceptedAtUtc);
+public enum BidOutcome
+{
+    Accepted,
+    Outbid
+}
+public sealed record PlaceBidRequest(
+    Guid id,
+    int amountInCents,
+    string userEmail,
+    string message,
+    TaskCompletionSource<BidResult> complete);
+
+public sealed record WinningBid(
+    Guid Id, 
+    int AmountInCents, 
+    string UserEmail, 
+    DateTime AcceptedAtUtc);
+
+public sealed record BidResult(
+    Guid BidId,
+    BidOutcome Outcome,
+    int HighestAmountInCents,
+    DateTime ProcessedAtUtc);

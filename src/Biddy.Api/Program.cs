@@ -4,8 +4,8 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddHostedService<Processor>();
 builder.Services.AddSingleton<AuctionState>();
-builder.Services.AddSingleton<Channel<ChannelRequest>>(
-    _ => Channel.CreateUnbounded<ChannelRequest>(
+builder.Services.AddSingleton<Channel<PlaceBidRequest>>(
+    _ => Channel.CreateUnbounded<PlaceBidRequest>(
         new UnboundedChannelOptions
         {
             SingleReader = true,
@@ -27,18 +27,43 @@ var app = builder.Build();
 
 app.MapGet("/", () => "Hello Auction!");
 
-app.MapPost("bid", async (BidRequest bid, Channel<ChannelRequest> channel, CancellationToken ct) =>
+app.MapPost("bid", async (BidRequest bid, Channel<PlaceBidRequest> channel, CancellationToken ct) =>
 {
     var bidId = Guid.CreateVersion7();
-    await channel.Writer.WriteAsync(
-        new ChannelRequest(
-            bidId,
-            bid.AmountInCents,
-            bid.UserEmail,
-            $"Bid:{bidId} recieved - {DateTime.UtcNow}"
-        ), ct);
+    var complete = new TaskCompletionSource<BidResult>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    return Results.Accepted(value: new { bidId });
+    try
+    {
+        await channel.Writer.WriteAsync(
+            new PlaceBidRequest(
+                bidId,
+                bid.AmountInCents,
+                bid.UserEmail,
+                $"Bid:{bidId} received - {DateTime.UtcNow}",
+                complete),
+            ct);
+
+        var result = await complete.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
+
+        return result.Outcome switch
+        {
+            BidOutcome.Accepted => Results.Ok(result),
+            BidOutcome.Outbid   => Results.Conflict(result),
+            _ => Results.StatusCode(StatusCodes.Status500InternalServerError)
+        };
+    }
+    catch (TimeoutException)
+    {
+        return Results.Accepted(value: new { bidId, status = "pending" });
+    }
+    catch (ChannelClosedException)
+    {
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
+    catch (OperationCanceledException) when(!ct.IsCancellationRequested)
+    {
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
 });
 
 app.Run();
