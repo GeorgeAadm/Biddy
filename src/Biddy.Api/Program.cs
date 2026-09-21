@@ -1,71 +1,94 @@
 using System.Threading.Channels;
+using Microsoft.AspNetCore.Http.HttpResults;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddHostedService<Processor>();
-builder.Services.AddSingleton<AuctionState>();
-builder.Services.AddSingleton<Channel<PlaceBidRequest>>(
-    _ => Channel.CreateUnbounded<PlaceBidRequest>(
-        new UnboundedChannelOptions
-        {
-            SingleReader = true,
-            AllowSynchronousContinuations = false
-        })
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton(_ => new AuctionStore(SeedAuctions.Create()));
+builder.Services.AddSingleton(_ => new BidQueue(capacity: 10_000));
+builder.Services.AddHostedService<BidProcessor>();
 
-/*
-_ => Channel.CreateBounded<ChannelRequest>(
-new BoundedChannelOptions(1)
-{
-    FullMode = BoundedChannelFullMode.Wait,
-    SingleReader = false,
-    AllowSynchronousContinuations = false
-})
-*/
-);
 
 var app = builder.Build();
 
-app.MapGet("/", () => "Hello Auction!");
+var resultTimeout = TimeSpan.FromSeconds(5);
 
-app.MapPost("bid", async (BidRequest bid, Channel<PlaceBidRequest> channel, CancellationToken ct) =>
+app.MapGet("/auctions", (AuctionStore store) =>
+    store.All.Select(AuctionView.From));
+ 
+app.MapGet("/auctions/{auctionId:guid}", (Guid auctionId, AuctionStore store) =>
+    store.TryGet(auctionId, out var auction)
+        ? Results.Ok(AuctionView.From(auction))
+        : Results.NotFound());
+
+app.MapPost("/auctions/{auctionId:guid}/bids", async (
+    Guid auctionId,
+    [Microsoft.AspNetCore.Mvc.FromHeader(Name = "Idempotency-Key")] string? idempotencyKey,
+    BidRequest request,
+    AuctionStore store,
+    BidQueue queue,
+    TimeProvider time,
+    CancellationToken ct) =>
 {
-    var bidId = Guid.CreateVersion7();
-    var complete = new TaskCompletionSource<BidResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+    if (!store.TryGet(auctionId, out var auction))
+        return Results.NotFound();
 
+    if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 255)
+        return Results.Problem(
+            statusCode: StatusCodes.Status400BadRequest,
+            title: "An Idempotency-Key header (max 255 characters) is required.");
+ 
+    if (request.Validate() is { } errors)
+        return Results.ValidationProblem(errors);
+ 
+    var bid = PlaceBid.Create(auction, idempotencyKey, request.AmountInCents, request.UserEmail!.Trim());
+ 
+    // Queue full or shutting down -> not growing memory without limit.
+    if (!queue.TryEnqueue(bid))
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+ 
+    // Once queued, if client disconnects, it is still processed.
     try
     {
-        await channel.Writer.WriteAsync(
-            new PlaceBidRequest(
-                bidId,
-                bid.AmountInCents,
-                bid.UserEmail,
-                $"Bid:{bidId} received - {DateTime.UtcNow}",
-                complete),
-            ct);
+        var decision = await bid.Completion.Task.WaitAsync(resultTimeout, time, ct);
 
-        var result = await complete.Task.WaitAsync(TimeSpan.FromSeconds(10), ct);
-
-        return result.Outcome switch
+        switch (decision)
         {
-            BidOutcome.Accepted => Results.Ok(result),
-            BidOutcome.Outbid   => Results.Conflict(result),
-            _ => Results.StatusCode(StatusCodes.Status500InternalServerError)
-        };
+            case IdempotencyKeyConflict:
+                return Results.Problem(
+                    statusCode: StatusCodes.Status422UnprocessableEntity,
+                    title: "This Idempotency-Key was already used for a different bid.");
+
+            case BidProcessed { Result: var result, Replayed: var replayed }:
+                IResult response = result.Outcome == BidOutcome.Accepted
+                    ? Results.Ok(result)
+                    : Results.Conflict(result);
+                return (replayed) ? new ReplayedResult(response) : response;
+
+            default:
+                return Results.StatusCode(StatusCodes.Status500InternalServerError);
+        }
     }
     catch (TimeoutException)
     {
-        return Results.Accepted(value: new { bidId, status = "pending" });
+        // Still queued + will be processed. client can check the auction's highest bid.
+        return Results.Accepted($"/auctions/{auctionId}", new { bid.BidId, Status = "pending" });
     }
-    catch (ChannelClosedException)
+    catch (OperationCanceledException) when (!ct.IsCancellationRequested)
     {
-        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
-    }
-    catch (OperationCanceledException) when(!ct.IsCancellationRequested)
-    {
+        // processor cancelled this bid / shutdown
         return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
     }
 });
 
+
 app.Run();
 
-public record BidRequest(int AmountInCents, string UserEmail);
+sealed class ReplayedResult(IResult inner) : IResult
+{
+    public Task ExecuteAsync(HttpContext http)
+    {
+        http.Response.Headers.Append("Idempotent-Replayed", "true");
+        return inner.ExecuteAsync(http);
+    }
+}

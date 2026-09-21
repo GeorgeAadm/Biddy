@@ -1,92 +1,82 @@
 
 using System.Threading.Channels;
 
-public sealed class AuctionState
-{
-    private WinningBid? _highest;
-    public WinningBid? Highest => Volatile.Read(ref _highest);
-    public void SetHighest(WinningBid bid) => Volatile.Write(ref _highest, bid);
-}
-public sealed class Processor : BackgroundService
-{
-    private readonly Channel<PlaceBidRequest> _channel;
-    private readonly AuctionState _state;
+// The only code that changes auction state.
+// One reader means bids are applied strictly one at a time, in arrival order, without locks.
+// This loop is also where persistence would go.
 
-    public Processor(Channel<PlaceBidRequest> channel, AuctionState state)
-    {
-        _channel = channel;
-        _state = state;
-    }
-    
-    protected override async Task ExecuteAsync(CancellationToken ct)
+public sealed class BidProcessor(
+    BidQueue queue,
+    TimeProvider time,
+    ILogger<BidProcessor> logger) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         try
         {
-            await foreach (var request in _channel.Reader.ReadAllAsync(ct))
+            await foreach (var bid in queue.Reader.ReadAllAsync(stoppingToken))
             {
                 try
                 {
-                    // await Task.Delay(1000, ct);
-                    Console.WriteLine(request.message);
-
-                    var current = _state.Highest;
-                    var now = DateTime.UtcNow;
-
-                    if (current is null || request.amountInCents > current.AmountInCents)
-                    {
-                        _state.SetHighest(new WinningBid(request.id, request.amountInCents, request.userEmail, now));
-                        Console.WriteLine($"Bid:{request.id} ACCEPTED A - {now}");
-                        request.complete.TrySetResult(
-                            new BidResult(request.id, BidOutcome.Accepted, request.amountInCents, now));
-                    }
-                    else
-                    {
-                        Console.WriteLine($"Bid:{request.id} REJECTED R - {now}");
-                        request.complete.TrySetResult(
-                            new BidResult(request.id, BidOutcome.Outbid, current.AmountInCents, now));
-                    }
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                {
-                    request.complete.TrySetCanceled(ct);
-                    throw;
+                    bid.Completion.TrySetResult(Process(bid));
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Bid:{request.id} failed - {ex.Message}");
-                    request.complete.TrySetException(ex);
+                    logger.LogError(ex, "Bid {BidId} on auction {AuctionId} failed", bid.BidId, bid.Auction.Id);
+                    bid.Completion.TrySetException(ex);
                 }
             }
         }
         finally
         {
-            _channel.Writer.TryComplete();
-            while (_channel.Reader.TryRead(out var pending))
-                pending.complete.TrySetCanceled();
+            // Stop accepting new bids -> then release still waiting.
+            queue.Complete();
+            while (queue.Reader.TryRead(out var pending)) 
+                pending.Completion.TrySetCanceled();
         }
+    }
+    
+    private BidDecision Process(PlaceBid bid)
+    {
+        var auction = bid.Auction;
+
+        if (auction.TryGetProcessed(bid.IdempotencyKey, out var previous))
+        {
+            if (!previous.Matches(bid))
+            {
+                logger.LogWarning("Idempotency key reused with a different bid on auction {AuctionId}", auction.Id);
+                return new IdempotencyKeyConflict();
+            }
+
+            logger.LogInformation("Bid {BidId} replayed on auction {AuctionId}", previous.Result.BidId, auction.Id);
+            return new BidProcessed(previous.Result, Replayed: true);
+        }
+
+        var result = Decide(bid);
+        auction.RecordProcessed(bid.IdempotencyKey, new ProcessedBid(bid.AmountInCents, bid.UserEmail, result));
+        return new BidProcessed(result, Replayed: false);
+    }
+
+    private BidResult Decide(PlaceBid bid)
+    {
+        var auction = bid.Auction;
+        var current = auction.Highest;
+        var now = time.GetUtcNow().UtcDateTime;
+ 
+        if (current is not null && bid.AmountInCents <= current.AmountInCents)
+        {
+            logger.LogInformation("Bid {BidId} on auction {AuctionId} outbid: {Amount} <= {Highest}",
+                bid.BidId, auction.Id, bid.AmountInCents, current.AmountInCents);
+ 
+            return new BidResult(bid.BidId, auction.Id, BidOutcome.Outbid, current.AmountInCents, now);
+        }
+        
+        auction.SetHighest(new WinningBid(bid.BidId, bid.AmountInCents, bid.UserEmail, now));
+
+        logger.LogInformation("Bid {BidId} on auction {AuctionId} accepted: {Amount}",
+            bid.BidId, auction.Id, bid.AmountInCents);
+
+        return new BidResult(bid.BidId, auction.Id, BidOutcome.Accepted, bid.AmountInCents, now);
     }
 }
 
-public enum BidOutcome
-{
-    Accepted,
-    Outbid
-}
-public sealed record PlaceBidRequest(
-    Guid id,
-    int amountInCents,
-    string userEmail,
-    string message,
-    TaskCompletionSource<BidResult> complete);
-
-public sealed record WinningBid(
-    Guid Id, 
-    int AmountInCents, 
-    string UserEmail, 
-    DateTime AcceptedAtUtc);
-
-public sealed record BidResult(
-    Guid BidId,
-    BidOutcome Outcome,
-    int HighestAmountInCents,
-    DateTime ProcessedAtUtc);
