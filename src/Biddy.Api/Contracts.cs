@@ -7,13 +7,6 @@ public enum BidOutcome
     Accepted,
     Outbid
 }
-public sealed record PlaceBidRequest(
-    Guid id,
-    int amountInCents,
-    string userEmail,
-    string message,
-    TaskCompletionSource<BidDecision> complete);
-    
 public sealed record BidRequest(int AmountInCents, string? UserEmail)
 {
     public Dictionary<string, string[]>? Validate()

@@ -1,6 +1,3 @@
-using System.Threading.Channels;
-using Microsoft.AspNetCore.Http.HttpResults;
-
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSingleton(TimeProvider.System);

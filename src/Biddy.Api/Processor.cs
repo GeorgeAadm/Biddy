@@ -1,6 +1,4 @@
 
-using System.Threading.Channels;
-
 // The only code that changes auction state.
 // One reader means bids are applied strictly one at a time, in arrival order, without locks.
 // This loop is also where persistence would go.
